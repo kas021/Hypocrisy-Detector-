@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en" class="bg-slate-950">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hypocrisy Detector</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script src="https://unpkg.com/htmx.org/dist/ext/json-enc.js"></script>
+  </head>
+  <body class="min-h-screen bg-slate-950 text-slate-100">
+    <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-10">
+      <div class="mx-auto max-w-4xl px-6 py-4">
+        <h1 class="text-2xl font-semibold tracking-tight">Hypocrisy Detector</h1>
+        <p class="text-sm text-slate-400">
+          Record a statement, transcribe locally, then compare it against known quotes.
+        </p>
+      </div>
+    </header>
+
+    <main class="mx-auto max-w-4xl px-6 py-8 space-y-10">
+      <section class="rounded-xl border border-slate-800 bg-slate-900/60 p-6 shadow-lg shadow-slate-900/40">
+        <h2 class="text-lg font-semibold">1. Record speech</h2>
+        <p class="mt-2 text-sm text-slate-400">
+          Audio never leaves your machine. Click record, speak a sentence, then stop to transcribe.
+        </p>
+        <div class="mt-4 flex flex-wrap items-center gap-4">
+          <button
+            id="start-record"
+            class="rounded-md bg-emerald-500 px-4 py-2 font-medium text-slate-950 transition hover:bg-emerald-400 disabled:opacity-40"
+          >
+            Start recording
+          </button>
+          <button
+            id="stop-record"
+            class="rounded-md bg-rose-500 px-4 py-2 font-medium text-slate-50 transition hover:bg-rose-400 disabled:opacity-40"
+            disabled
+          >
+            Stop &amp; transcribe
+          </button>
+          <p id="recording-status" class="text-sm text-slate-300">
+            Microphone idle.
+          </p>
+        </div>
+      </section>
+
+      <section class="rounded-xl border border-slate-800 bg-slate-900/60 p-6 shadow-lg shadow-slate-900/40 space-y-4">
+        <div>
+          <h2 class="text-lg font-semibold">2. Type a statement</h2>
+          <p class="mt-1 text-sm text-slate-400">
+            Paste or edit the most recent transcription, then run the hypocrisy check.
+          </p>
+        </div>
+        <textarea
+          id="statement-input"
+          class="w-full rounded-lg border border-slate-700 bg-slate-950/60 p-3 font-mono text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
+          rows="4"
+          placeholder="The sky is definitely green today."
+        ></textarea>
+        <div class="flex items-center justify-between">
+          <button
+            id="run-check"
+            class="inline-flex items-center gap-2 rounded-md bg-indigo-500 px-4 py-2 font-semibold text-slate-50 transition hover:bg-indigo-400 disabled:opacity-40"
+            hx-post="/api/hypocrisy"
+            hx-trigger="click"
+            hx-ext="json-enc"
+            hx-vals='js:{text: document.getElementById("statement-input").value}'
+            hx-swap="none"
+            hx-on::after-request="renderHypocrisy(event)"
+          >
+            <span>Run hypocrisy check</span>
+          </button>
+          <span id="run-status" class="text-sm text-slate-400"></span>
+        </div>
+      </section>
+
+      <section class="rounded-xl border border-slate-800 bg-slate-900/60 p-6 shadow-lg shadow-slate-900/40">
+        <div class="flex items-center justify-between">
+          <h2 class="text-lg font-semibold">3. Results</h2>
+          <span id="result-count" class="text-xs uppercase tracking-wide text-slate-500">No runs yet</span>
+        </div>
+        <div id="results" class="mt-4 space-y-4"></div>
+      </section>
+    </main>
+
+    <template id="hit-template">
+      <article class="rounded-lg border border-slate-800 bg-slate-950/60 p-4">
+        <div class="flex items-center justify-between gap-4">
+          <span class="text-xs font-semibold uppercase tracking-wide text-emerald-300">
+            Score <span data-field="score"></span>
+          </span>
+          <a
+            data-field="link"
+            class="text-sm font-medium text-indigo-300 hover:text-indigo-200"
+            target="_blank"
+            rel="noopener"
+          >
+            View source
+          </a>
+        </div>
+        <p class="mt-3 text-sm text-slate-200" data-field="quote"></p>
+        <p class="mt-3 text-xs text-slate-400" data-field="meta"></p>
+      </article>
+    </template>
+
+    <script>
+      const recordBtn = document.getElementById('start-record');
+      const stopBtn = document.getElementById('stop-record');
+      const statusEl = document.getElementById('recording-status');
+      const inputEl = document.getElementById('statement-input');
+      const runStatus = document.getElementById('run-status');
+      const resultsEl = document.getElementById('results');
+      const resultCount = document.getElementById('result-count');
+      const hitTemplate = document.getElementById('hit-template');
+
+      let mediaRecorder;
+      let recordedChunks = [];
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        recordBtn.disabled = true;
+        stopBtn.disabled = true;
+        setStatus('Microphone not available in this browser.');
+      }
+
+      recordBtn.addEventListener('click', async () => {
+        recordedChunks = [];
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+          mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) {
+              recordedChunks.push(event.data);
+            }
+          };
+          mediaRecorder.onstop = handleRecordingStop;
+          mediaRecorder.start();
+          recordBtn.disabled = true;
+          stopBtn.disabled = false;
+          setStatus('Recording… click stop when finished.');
+        } catch (error) {
+          console.error(error);
+          setStatus('Unable to access microphone.');
+        }
+      });
+
+      stopBtn.addEventListener('click', () => {
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+          mediaRecorder.stop();
+        }
+        recordBtn.disabled = false;
+        stopBtn.disabled = true;
+        setStatus('Processing audio…');
+      });
+
+      async function handleRecordingStop() {
+        const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+        const formData = new FormData();
+        formData.append('file', blob, 'recording.webm');
+        try {
+          const response = await fetch('/api/transcribe', {
+            method: 'POST',
+            body: formData,
+          });
+          if (!response.ok) {
+            const detail = await response.json().catch(() => ({ detail: 'Transcription failed.' }));
+            setStatus(detail.detail || 'Transcription failed.');
+            return;
+          }
+          const data = await response.json();
+          if (data.segments && data.segments.length) {
+            inputEl.value = data.segments.map(seg => seg.text).join(' ');
+            setStatus(`Transcribed ${data.segments.length} segments.`);
+          } else {
+            setStatus('No speech detected.');
+          }
+        } catch (error) {
+          console.error(error);
+          setStatus('Network error during transcription.');
+        }
+      }
+
+      window.renderHypocrisy = function(event) {
+        const xhr = event.detail && event.detail.xhr;
+        if (!xhr) {
+          return;
+        }
+        try {
+          const payload = JSON.parse(xhr.responseText);
+          renderResults(payload);
+        } catch (error) {
+          runStatus.textContent = 'Unable to parse response.';
+        }
+      };
+
+      function formatTime(seconds) {
+        if (seconds == null) return '';
+        const date = new Date(seconds * 1000);
+        return date.toISOString().substr(11, 8);
+      }
+
+      function renderResults(payload) {
+        resultsEl.innerHTML = '';
+        const hits = payload.hits || [];
+        resultCount.textContent = hits.length ? `${hits.length} contradictions` : 'No contradictions found';
+        runStatus.textContent = hits.length ? 'Contradictions ranked by likelihood.' : '';
+        if (!hits.length) {
+          return;
+        }
+        hits.forEach(hit => {
+          const node = hitTemplate.content.firstElementChild.cloneNode(true);
+          node.querySelector('[data-field="score"]').textContent = hit.score.toFixed(2);
+          node.querySelector('[data-field="quote"]').textContent = `“${hit.corpus_text}”`;
+          const metaParts = [hit.source_title];
+          if (hit.ts_start != null) {
+            const jump = `Jump to ${formatTime(hit.ts_start)}`;
+            metaParts.push(jump);
+          }
+          node.querySelector('[data-field="meta"]').textContent = metaParts.filter(Boolean).join(' · ');
+          const link = node.querySelector('[data-field="link"]');
+          if (hit.url_or_path) {
+            let href = hit.url_or_path;
+            if (hit.ts_start != null && href.endsWith('.mp4')) {
+              href += `#t=${Math.floor(hit.ts_start)}`;
+            }
+            link.href = href;
+          } else {
+            link.removeAttribute('href');
+            link.textContent = 'Source unavailable';
+            link.classList.add('pointer-events-none', 'text-slate-500');
+          }
+          resultsEl.appendChild(node);
+        });
+      }
+    </script>
+  </body>
+</html>
