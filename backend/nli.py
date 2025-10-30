@@ -1,71 +1,116 @@
+"""Natural language inference scoring helpers."""
+from __future__ import annotations
 
-from pathlib import Path
-from typing import List, Dict, Tuple
+import logging
+from dataclasses import dataclass
+from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-# Optional ONNX runtime acceleration
-_ORT_OK = True
-try:
-    import onnxruntime as ort
-except Exception:
-    _ORT_OK = False
-    ort = None
+from .config import REPO_ROOT, ensure_dirs, get_config
 
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+LOGGER = logging.getLogger(__name__)
 
-LABELS = ["contradiction", "neutral", "entailment"]
+
+@dataclass
+class _PytorchBackend:
+    tokenizer: AutoTokenizer
+    model: AutoModelForSequenceClassification
+
+    def score(self, pairs: Sequence[Tuple[str, str]]):
+        inputs = self.tokenizer(
+            [premise for premise, _ in pairs],
+            [hypothesis for _, hypothesis in pairs],
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        )
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        logits = outputs.logits
+        probs = torch.softmax(logits, dim=-1)
+        contradiction_idx = 0 if probs.shape[-1] == 1 else 0
+        # huggingface cross-encoders typically use [contradiction, neutral, entailment]
+        if probs.shape[-1] >= 3:
+            contradiction_idx = 0
+        elif probs.shape[-1] == 2:
+            # binary classification - assume index 0 is contradiction
+            contradiction_idx = 0
+        return probs[:, contradiction_idx].cpu().numpy().tolist()
+
+
+@dataclass
+class _OnnxBackend:
+    session: "onnxruntime.InferenceSession"
+    tokenizer: AutoTokenizer
+
+    def score(self, pairs: Sequence[Tuple[str, str]]):
+        inputs = self.tokenizer(
+            [premise for premise, _ in pairs],
+            [hypothesis for _, hypothesis in pairs],
+            padding=True,
+            truncation=True,
+            return_tensors="np",
+        )
+        ort_inputs = {k: v for k, v in inputs.items()}
+        outputs = self.session.run(None, ort_inputs)
+        logits = outputs[0]
+        exp = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
+        probs = exp / exp.sum(axis=-1, keepdims=True)
+        contradiction_idx = 0
+        if probs.shape[-1] >= 3:
+            contradiction_idx = 0
+        elif probs.shape[-1] == 2:
+            contradiction_idx = 0
+        return probs[:, contradiction_idx].tolist()
+
 
 class NLIScorer:
-    """
-    If backend/nli_onnx exists with model.onnx and tokenizer files, use ONNX.
-    Otherwise fall back to a PyTorch Transformers pipeline (roberta-base MNLI).
-    """
-    def __init__(self, onnx_dir: str = "backend/nli_onnx", hf_model: str = "cross-encoder/nli-roberta-base"):
-        self.onnx_dir = Path(onnx_dir)
-        self.use_onnx = _ORT_OK and self._onnx_available()
-        if self.use_onnx:
-            self.session = ort.InferenceSession(str(self.onnx_dir/"model.onnx"), providers=["CPUExecutionProvider"])
-            self.tokenizer = AutoTokenizer.from_pretrained(str(self.onnx_dir))
-        else:
-            self.tokenizer = AutoTokenizer.from_pretrained(hf_model)
-            self.pipe = pipeline("text-classification", model=hf_model, tokenizer=self.tokenizer, return_all_scores=True)
+    """Score hypothesis/premise pairs using PyTorch or ONNX."""
 
-    def _onnx_available(self) -> bool:
-        return (self.onnx_dir/"model.onnx").exists() and (self.onnx_dir/"tokenizer.json").exists()
+    def __init__(self, model_name: str | None = None) -> None:
+        config = get_config()
+        ensure_dirs()
+        self.model_name = model_name or config.get(
+            "HF_NLI_MODEL", "cross-encoder/nli-deberta-v3-xsmall"
+        )
+        self.backend = self._load_backend()
 
-    def score(self, claim: str, texts: List[str]) -> List[Dict]:
-        if not texts:
+    def _load_backend(self):
+        onnx_path = REPO_ROOT / "backend" / "nli_onnx" / "model.onnx"
+        if onnx_path.exists():
+            try:
+                import onnxruntime as ort  # type: ignore
+
+                LOGGER.info("Loading NLI model from ONNX: %s", onnx_path)
+                sess = ort.InferenceSession(str(onnx_path))
+                tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_name, use_fast=False
+                )
+                return _OnnxBackend(session=sess, tokenizer=tokenizer)
+            except ImportError:
+                LOGGER.warning(
+                    "onnxruntime not available - falling back to PyTorch backend"
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                LOGGER.warning("Failed to load ONNX backend: %s", exc)
+        LOGGER.info("Loading NLI model with PyTorch: %s", self.model_name)
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=False)
+        model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
+        model.eval()
+        return _PytorchBackend(tokenizer=tokenizer, model=model)
+
+    def score(self, premise: str, hypothesis: str) -> float:
+        result = self.score_batch([(premise, hypothesis)])
+        return result[0]
+
+    def score_batch(self, pairs: Iterable[Tuple[str, str]]) -> List[float]:
+        pair_list = list(pairs)
+        if not pair_list:
             return []
-        if self.use_onnx:
-            return self._score_onnx(claim, texts)
-        else:
-            return self._score_pipeline(claim, texts)
+        return self.backend.score(pair_list)
 
-    def _score_pipeline(self, claim: str, texts: List[str]) -> List[Dict]:
-        pairs = [(claim, t) for t in texts]
-        outs = self.pipe(pairs, truncation=True)
-        results = []
-        for scores in outs:
-            # scores is list of dicts with 'label' and 'score'
-            by_label = {d["label"].lower(): float(d["score"]) for d in scores}
-            # Map to fixed order
-            vec = [by_label.get(k, 0.0) for k in ["CONTRADICTION".lower(), "NEUTRAL".lower(), "ENTAILMENT".lower()]]
-            label = LABELS[int(np.argmax(vec))]
-            results.append({"probs": vec, "label": label})
-        return results
 
-    def _score_onnx(self, claim: str, texts: List[str]) -> List[Dict]:
-        # Tokenize batch
-        pairs = [(claim, t) for t in texts]
-        enc = self.tokenizer([a for a,b in pairs], [b for a,b in pairs], padding=True, truncation=True, return_tensors="np")
-        ort_inputs = {k: v for k, v in enc.items()}
-        logits = self.session.run(None, ort_inputs)[0]  # (N, 3)
-        # softmax
-        e = np.exp(logits - logits.max(axis=1, keepdims=True))
-        probs = e / e.sum(axis=1, keepdims=True)
-        results = []
-        for p in probs:
-            label = LABELS[int(np.argmax(p))]
-            results.append({"probs": p.tolist(), "label": label})
-        return results
+__all__ = ["NLIScorer"]
