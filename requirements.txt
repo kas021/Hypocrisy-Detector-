@@ -1,0 +1,23 @@
+# Core API
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+
+# ML
+sentence-transformers==2.3.1
+transformers==4.36.0
+tokenizers==0.15.2
+torch==2.1.0
+
+# ONNX runtime for optional NLI acceleration
+onnxruntime==1.17.0
+onnx==1.16.1
+
+# Utilities
+numpy==1.24.3
+pandas==2.3.3
+webvtt-py==0.4.6
+srt==3.5.3
+sqlite-utils==3.36
+ffmpeg-python==0.2.0
+rapidfuzz==3.6.1
+toml==0.10.2

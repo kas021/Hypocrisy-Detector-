@@ -1,0 +1,65 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Contradiction Finder — Fixed</title>
+    <style>
+        body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 960px; margin: 40px auto; padding: 0 16px; }
+        .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-bottom: 16px; }
+        textarea { width: 100%; height: 100px; padding: 10px; font-size: 16px; }
+        button { padding: 10px 16px; font-size: 16px; cursor: pointer; }
+        .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px 14px; margin: 10px 0; }
+        .pill { display:inline-block; padding: 2px 8px; border-radius: 100px; font-size: 12px; background:#eee; margin-left:6px;}
+        .meta { color:#666; font-size: 12px; }
+        .score { font-family: ui-monospace, Consolas, monospace; }
+    </style>
+</head>
+<body>
+    <h1>Contradiction Finder — Fixed</h1>
+    <p>Type a claim. The app retrieves the most similar segments and scores them with an NLI model (entailment/neutral/contradiction).</p>
+    <div class="row">
+        <textarea id="claim" placeholder="Example: He said taxes would not rise."></textarea>
+        <div>
+            <button onclick="search()">Search</button>
+            <div style="margin-top:8px;">
+                <label>Top K <input id="topk" type="number" value="6" min="1" max="50" style="width:64px"></label>
+            </div>
+        </div>
+    </div>
+    <div id="out"></div>
+
+    <script>
+        async function search(){
+            const claim = document.getElementById('claim').value.trim();
+            const topk = +document.getElementById('topk').value || 6;
+            if(!claim){ alert('Enter a claim.'); return; }
+            const resp = await fetch(`/api/search?` + new URLSearchParams({claim, top_k: topk}));
+            const data = await resp.json();
+            const out = document.getElementById('out');
+            out.innerHTML = '';
+            data.results.forEach((r, i) => {
+                const probs = r.nli.probs.map(x => x.toFixed(3));
+                const label = r.nli.label;
+                const el = document.createElement('div');
+                el.className = 'card';
+                el.innerHTML = `
+                    <div><strong>${i+1}. ${escapeHtml(label)}</strong>
+                        <span class="pill">embed=${r.embed_score.toFixed(3)}</span>
+                        <span class="pill">C=${probs[0]}</span>
+                        <span class="pill">N=${probs[1]}</span>
+                        <span class="pill">E=${probs[2]}</span>
+                    </div>
+                    <div style="margin-top:6px">${escapeHtml(r.text)}</div>
+                    <div class="meta" style="margin-top:8px">${escapeHtml(r.source||'')} — ${escapeHtml(r.title||'')} — ${escapeHtml(r.date||'')} <a href="${r.url||'#'}" target="_blank">link</a></div>
+                `;
+                out.appendChild(el);
+            });
+        }
+        function escapeHtml(str){
+            return String(str).replace(/[&<>"']/g, s => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[s]));
+        }
+    </script>
+</body>
+</html>

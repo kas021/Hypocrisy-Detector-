@@ -1,0 +1,22 @@
+
+Deployment guide (desktop + Raspberry Pi 4/5, 4GB)
+
+1) On your desktop
+   - `pip install -r requirements.txt`
+   - `make init-db`
+   - For each video+transcript: `make ingest VIDEO=... SUB=... SOURCE="..." DATE="YYYY-MM-DD" TITLE="..." URL="..."`
+   - `python tools/export_embeds.py`               # precompute vectors
+   - `python tools/export_nli_to_onnx.py`          # export + quantize NLI (and tokenizer)
+   - Copy the project to the Pi (or use `make deploy-to-pi` with PI_HOST set).
+
+2) On the Pi
+   - `sudo apt update && sudo apt install ffmpeg python3-pip`
+   - `pip install -r requirements.txt`
+   - `make run`
+   - Open `http://<pi-ip>:7860`
+
+Troubleshooting
+- If clipping fails, ffmpeg re-encode fallback will trigger automatically.
+- If no contradictions are returned, reduce thresholds or verify your NLI export.
+- Ensure backend/embed_model contains a sentence-transformers model folder or that
+  you've already downloaded the model name you pass to EmbeddingRetriever.
