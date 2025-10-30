@@ -1,6 +1,6 @@
 # Core API
 fastapi==0.109.0
-uvicorn[standard]==0.27.0
+uvicorn==0.27.0
 
 # ML
 sentence-transformers==2.3.1
@@ -15,9 +15,11 @@ onnx==1.16.1
 # Utilities
 numpy==1.24.3
 pandas==2.3.3
+requests==2.31.0
+beautifulsoup4==4.12.3
+feedparser==6.0.11
+yt-dlp==2024.8.6
 webvtt-py==0.4.6
 srt==3.5.3
 sqlite-utils==3.36
-ffmpeg-python==0.2.0
-rapidfuzz==3.6.1
 toml==0.10.2

@@ -1,56 +1,48 @@
+# Windows guide
 
-# Contradiction Finder — Fixed Build
+The Python CLIs shipped with the project keep everything PowerShell-free. The steps below assume a
+Command Prompt session opened at the repository root.
 
-This package replaces the incomplete files and gives you a working baseline.
+## One-time setup
 
-## Prereqs
-- Windows 10/11
-- Python 3.10.x (exactly — do not use 3.11)
-- FFmpeg installed (winget or choco), optional for media clipping
-
-## One-time setup (PowerShell)
-```powershell
-# From the project root (this folder)
-py -3.10 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
-python -m pip install -U pip
-pip install -r requirements.txt
-
-# Optional: download the small embedding model for offline use
-python - <<'PY'
-from sentence_transformers import SentenceTransformer
-SentenceTransformer('all-MiniLM-L6-v2').save('backend/embed_model')
-print('✓ embed_model saved to backend/embed_model')
-PY
-
-# Optional: export a small NLI model to ONNX for speed (or skip to use PyTorch fallback)
-python tools\export_nli_to_onnx.py
+```cmd
+py -3 -m venv .venv
+.venv\Scripts\python -m pip install --upgrade pip
+.venv\Scripts\pip install -r requirements.txt
 ```
 
-## Ingest your data
-You need a transcript file per video (SRT, VTT, or JSONL with start_ms/end_ms/text).
-```powershell
-# Example paths — change these to real files you have
-$VIDEO = 'E:\media\your_clip.mp4'
-$SUB   = 'E:\media\your_clip.srt'
+Optional extras:
 
-# Create the DB and ingest
-python -m backend.ingest --db backend\db.sqlite3 --video "$VIDEO" --subtitle "$SUB" --source "Your Channel" --date "2024-03-15" --title "Interview" --url "https://example.com/clip"
+- `pip install faster-whisper` enables the `/api/transcribe` endpoint for microphone recordings.
+- `pip install optimum[onnxruntime]` lets you run `python -m scripts.export_nli` to build the ONNX
+  inference bundle.
+
+## Check configuration and ingest the sample
+
+```cmd
+.venv\Scripts\python -m backend.config
+.venv\Scripts\python -m scripts.ingest --srt samples\media\your_clip.srt --title "Sample"
 ```
 
-## Precompute embeddings
-```powershell
-python tools\export_embeds.py
-```
+`python -m backend.config` creates the `data/` hierarchy (db, transcripts, uploads, raw). The ingest
+command loads the bundled transcript so the detector returns results immediately.
 
 ## Run the app
-```powershell
-uvicorn frontend.app:app --host 127.0.0.1 --port 7860 --reload
-# Open http://127.0.0.1:7860
+
+```cmd
+.venv\Scripts\python -m scripts.run
 ```
 
-## Notes
-- If you skip ONNX export, the NLI scorer falls back to a PyTorch model (`cross-encoder/nli-roberta-base`), which is compatible with the pinned tokenizers version.
-- If you see CUDA warnings, it will run on CPU automatically.
-- If you change requirements, stick to Python 3.10 to avoid toolchain mismatches.
+This command ensures dependencies are installed, prints the resolved paths, and launches uvicorn on
+`http://127.0.0.1:7860`. Visit the page to record speech, upload captions, or paste text, then click
+**Run hypocrisy check** to see ranked contradictions.
+
+## Optional scrape flow
+
+```cmd
+.venv\Scripts\python -m scripts.scrape --providers govuk,whitehouse --limit 25 --out data\raw\scraped.sqlite
+.venv\Scripts\python -m backend.ingest --from-scraped data\raw\scraped.sqlite
+```
+
+The UI also exposes a **Run scraper** button that triggers the same providers. Scraped rows are stored
+under `data/raw/` and can be ingested into the main corpus for contradiction detection.
