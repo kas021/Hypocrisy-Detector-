@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 
+
 @dataclass
 class Source:
     id: int
@@ -32,6 +33,7 @@ class HypocrisyHit:
     ts_start: Optional[float]
     ts_end: Optional[float]
     extra: Dict | None = None
+
 
 
 __all__ = ["Source", "Segment", "HypocrisyHit"]

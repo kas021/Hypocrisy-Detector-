@@ -10,6 +10,7 @@ try:  # pragma: no cover - optional dependency for tests
 except Exception:  # pragma: no cover - fallback
     np = None  # type: ignore
 
+
 from sentence_transformers import SentenceTransformer
 
 from .db import CorpusDatabase
@@ -35,6 +36,7 @@ class HypocrisyDetector:
         for segment, vector in segments:
             denom = (_norm(vector) or 1.0) * query_norm
             similarity = float(_dot(query_vec, vector) / denom)
+
             results.append((segment, similarity))
         results.sort(key=lambda item: item[1], reverse=True)
         return [segment for segment, _ in results[:limit]]
@@ -58,6 +60,7 @@ class HypocrisyDetector:
                     extra = json.loads(source["extra_json"])
                 except Exception:  # pragma: no cover - defensive parsing
                     extra = {}
+
             hits.append(
                 HypocrisyHit(
                     score=float(score),
@@ -68,6 +71,7 @@ class HypocrisyDetector:
                     ts_start=segment.ts_start,
                     ts_end=segment.ts_end,
                     extra=extra,
+
                 )
             )
         return hits
@@ -83,6 +87,7 @@ def _dot(a, b) -> float:
     if np is not None:
         return float(np.dot(a, b))
     return float(sum(float(x) * float(y) for x, y in zip(a, b)))
+
 
 
 __all__ = ["HypocrisyDetector"]

@@ -10,6 +10,7 @@ try:  # pragma: no cover - optional dependency for tests
 except Exception:  # pragma: no cover - fallback path
     np = None  # type: ignore
 
+
 from sqlite_utils import Database as SQLiteDatabase
 
 from .config import REPO_ROOT, ensure_dirs
@@ -28,6 +29,7 @@ class CorpusDatabase:
     def _ensure_schema(self) -> None:
         sources = self.db.table("sources")
         sources.create(
+
             {
                 "id": int,
                 "title": str,
@@ -36,6 +38,7 @@ class CorpusDatabase:
                 "published_at": str,
                 "author": str,
                 "extra_json": str,
+
             },
             pk="id",
             if_not_exists=True,
@@ -43,6 +46,7 @@ class CorpusDatabase:
         sources.create_index(["url_or_path"], if_not_exists=True, unique=True)
         segments = self.db.table("segments")
         segments.create(
+
             {
                 "id": int,
                 "source_id": int,
@@ -50,6 +54,7 @@ class CorpusDatabase:
                 "ts_start": float,
                 "ts_end": float,
                 "doc_id": str,
+
             },
             pk="id",
             if_not_exists=True,
@@ -57,6 +62,7 @@ class CorpusDatabase:
         segments.create_index(["doc_id"], if_not_exists=True)
         embeddings = self.db.table("embeddings")
         embeddings.create(
+
             {
                 "segment_id": int,
                 "vector": str,
@@ -104,6 +110,7 @@ class CorpusDatabase:
             return int(source_id)
 
         source_id = table.insert(payload, pk="id")
+
         return int(source_id)
 
     def add_segment(
@@ -115,6 +122,7 @@ class CorpusDatabase:
         embedding: Iterable[float],
         *,
         doc_id: Optional[str] = None,
+
     ) -> int:
         seg_table = self.db.table("segments")
         seg_id = seg_table.insert(
@@ -124,6 +132,7 @@ class CorpusDatabase:
                 "ts_start": ts_start,
                 "ts_end": ts_end,
                 "doc_id": doc_id,
+
             },
             pk="id",
         )
@@ -154,6 +163,7 @@ class CorpusDatabase:
                     vector = np.zeros(384, dtype="float32")
                 else:
                     vector = [0.0] * 384
+
             segments.append(
                 (
                     Segment(

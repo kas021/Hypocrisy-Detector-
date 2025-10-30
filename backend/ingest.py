@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
+
 try:  # pragma: no cover - imported lazily for helpful errors
     import srt
 except ImportError:  # pragma: no cover - optional dependency hint
@@ -29,6 +30,7 @@ from .db import CorpusDatabase
 
 _MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 _EMBEDDER = None
+
 
 
 def _repo_path(path: str | Path) -> Path:
@@ -126,6 +128,7 @@ def _ingest_segments(
             doc_id=doc_id,
         )
     return len(statements)
+
 
 
 def ingest_subtitle(subtitle_path: Path, source_title: str | None = None) -> int:
@@ -287,6 +290,7 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--srt", help="Path to .srt subtitle file")
     parser.add_argument("--text", help="Path to plain text file")
     parser.add_argument("--from-scraped", help="Path to scraped sqlite database")
+ 
     parser.add_argument("--title", help="Optional human readable title")
     args = parser.parse_args(argv)
 
@@ -300,6 +304,7 @@ def main(argv: List[str] | None = None) -> int:
         else:
             parser.error("Provide --srt, --text, or --from-scraped")
             return 1
+
     except (ValueError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

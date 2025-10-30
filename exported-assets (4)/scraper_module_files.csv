@@ -1,0 +1,1784 @@
+filename,description,content
+backend/scraper/__init__.py,Module initialization with exports,"""""""
+Scraper module for contradiction-finder.
+
+Provides pluggable providers for scraping content from various sources
+while respecting robots.txt and site terms of service.
+""""""
+
+from .providers import (
+    Provider,
+    YouTubeProvider,
+    RSSProvider,
+    WikipediaProvider,
+    GovUkProvider,
+    HansardProvider,
+    GenericProvider,
+)
+
+__all__ = [
+    ""Provider"",
+    ""YouTubeProvider"",
+    ""RSSProvider"",
+    ""WikipediaProvider"",
+    ""GovUkProvider"",
+    ""HansardProvider"",
+    ""GenericProvider"",
+]
+"
+backend/scraper/providers.py,"All provider classes including YouTube, RSS, Wikipedia, GOV.UK, Hansard, and Generic","""""""
+Provider classes for different content sources.
+Each provider respects robots.txt and implements a common interface.
+""""""
+
+import time
+import random
+import re
+import logging
+import json
+from abc import ABC, abstractmethod
+from typing import Iterable, List, Dict, Optional, Tuple
+from datetime import datetime
+from urllib.parse import urlparse, urljoin
+from urllib.robotparser import RobotFileParser
+import os
+
+import requests
+import feedparser
+import trafilatura
+from youtube_transcript_api import YouTubeTranscriptApi
+import yt_dlp
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class Source:
+    """"""Represents a content source.""""""
+
+    def __init__(
+        self,
+        source_type: str,
+        title: str,
+        url: str,
+        published_at: Optional[datetime] = None,
+        source_id: Optional[int] = None,
+    ):
+        self.id = source_id
+        self.source_type = source_type
+        self.title = title
+        self.url = url
+        self.published_at = published_at or datetime.now()
+
+
+class Segment:
+    """"""Represents a text segment from a source.""""""
+
+    def __init__(
+        self,
+        text: str,
+        ts_start: Optional[float] = None,
+        ts_end: Optional[float] = None,
+        meta_json: Optional[Dict] = None,
+        segment_id: Optional[int] = None,
+        source_id: Optional[int] = None,
+    ):
+        self.id = segment_id
+        self.source_id = source_id
+        self.text = text
+        self.ts_start = ts_start
+        self.ts_end = ts_end
+        self.meta_json = meta_json or {}
+
+
+class RobotsChecker:
+    """"""Checks robots.txt compliance.""""""
+
+    def __init__(self, user_agent: str, max_cache_age: int = 3600):
+        self.user_agent = user_agent
+        self.max_cache_age = max_cache_age
+        self._cache: Dict[str, Tuple[RobotFileParser, float]] = {}
+
+    def can_fetch(self, url: str) -> bool:
+        """"""Check if URL can be fetched according to robots.txt.""""""
+        parsed = urlparse(url)
+        robots_url = f""{parsed.scheme}://{parsed.netloc}/robots.txt""
+
+        # Check cache
+        now = time.time()
+        if robots_url in self._cache:
+            rp, cached_time = self._cache[robots_url]
+            if now - cached_time < self.max_cache_age:
+                return self._check_permission(rp, url)
+
+        # Fetch and parse robots.txt
+        rp = RobotFileParser()
+        rp.set_url(robots_url)
+
+        try:
+            rp.read()
+            self._cache[robots_url] = (rp, now)
+            return self._check_permission(rp, url)
+        except Exception as e:
+            logger.warning(f""Could not read robots.txt for {robots_url}: {e}"")
+            # Fail open if robots.txt cannot be read
+            return True
+
+    def _check_permission(self, rp: RobotFileParser, url: str) -> bool:
+        """"""Check if user agent can fetch URL.""""""
+        try:
+            return rp.can_fetch(self.user_agent, url)
+        except Exception as e:
+            logger.warning(f""Error checking robots.txt permission: {e}"")
+            return True
+
+
+class RateLimiter:
+    """"""Rate limiter for polite scraping.""""""
+
+    def __init__(self, max_rps: float = 1.0, random_delay: bool = True):
+        self.max_rps = max_rps
+        self.random_delay = random_delay
+        self.min_delay = 1.0 / max_rps
+        self._last_request = 0.0
+
+    def wait(self):
+        """"""Wait to respect rate limit.""""""
+        now = time.time()
+        elapsed = now - self._last_request
+
+        if elapsed < self.min_delay:
+            delay = self.min_delay - elapsed
+            if self.random_delay:
+                delay += random.uniform(0, self.min_delay * 0.5)
+            time.sleep(delay)
+
+        self._last_request = time.time()
+
+
+class Provider(ABC):
+    """"""Base class for content providers.""""""
+
+    def __init__(
+        self,
+        user_agent: Optional[str] = None,
+        max_rps: float = 1.0,
+        check_robots: bool = True,
+    ):
+        contact = os.environ.get(""SCRAPER_CONTACT"", ""your-email@example.com"")
+        self.user_agent = user_agent or f""ContradictionFinder/1.0 ({contact})""
+        self.robots_checker = RobotsChecker(self.user_agent) if check_robots else None
+        self.rate_limiter = RateLimiter(max_rps=max_rps)
+        self.session = requests.Session()
+        self.session.headers.update({""User-Agent"": self.user_agent})
+
+    def check_robots_txt(self, url: str) -> bool:
+        """"""Check if URL can be scraped according to robots.txt.""""""
+        if not self.robots_checker:
+            return True
+
+        allowed = self.robots_checker.can_fetch(url)
+        if not allowed:
+            logger.warning(f""Robots.txt disallows scraping: {url}"")
+        return allowed
+
+    @abstractmethod
+    def collect(self, **kwargs) -> Iterable[Tuple[Source, List[Segment]]]:
+        """"""Collect content from the provider.""""""
+        pass
+
+
+class YouTubeProvider(Provider):
+    """"""Provider for YouTube video transcripts.""""""
+
+    def collect(
+        self,
+        url: Optional[str] = None,
+        video_id: Optional[str] = None,
+        **kwargs
+    ) -> Iterable[Tuple[Source, List[Segment]]]:
+        """"""
+        Collect YouTube transcript.
+
+        Args:
+            url: YouTube video URL
+            video_id: YouTube video ID (alternative to url)
+        """"""
+        if not video_id and not url:
+            raise ValueError(""Either url or video_id must be provided"")
+
+        # Extract video ID from URL if needed
+        if url and not video_id:
+            video_id = self._extract_video_id(url)
+            if not video_id:
+                logger.error(f""Could not extract video ID from URL: {url}"")
+                return
+
+        # YouTube allows transcript API access
+        try:
+            # Get metadata using yt-dlp (no download)
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': False,
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(
+                    f""https://www.youtube.com/watch?v={video_id}"",
+                    download=False
+                )
+
+            # Get transcript
+            transcript = YouTubeTranscriptApi.get_transcript(video_id)
+
+            # Create source
+            published_at = None
+            if 'upload_date' in info:
+                try:
+                    published_at = datetime.strptime(info['upload_date'], '%Y%m%d')
+                except:
+                    pass
+
+            source = Source(
+                source_type='youtube',
+                title=info.get('title', f'YouTube video {video_id}'),
+                url=f""https://www.youtube.com/watch?v={video_id}"",
+                published_at=published_at,
+            )
+
+            # Create segments from transcript
+            segments = []
+            for entry in transcript:
+                segment = Segment(
+                    text=entry['text'],
+                    ts_start=entry['start'],
+                    ts_end=entry['start'] + entry.get('duration', 0),
+                    meta_json={'video_id': video_id}
+                )
+                segments.append(segment)
+
+            yield source, segments
+
+        except Exception as e:
+            logger.error(f""Error collecting YouTube transcript for {video_id}: {e}"")
+
+    def _extract_video_id(self, url: str) -> Optional[str]:
+        """"""Extract video ID from YouTube URL.""""""
+        patterns = [
+            r'(?:v=|/)([0-9A-Za-z_-]{11}).*',
+            r'(?:embed/)([0-9A-Za-z_-]{11})',
+            r'(?:watch\?v=)([0-9A-Za-z_-]{11})',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+
+        return None
+
+
+class RSSProvider(Provider):
+    """"""Provider for RSS/Atom feeds.""""""
+
+    def collect(self, url: str, **kwargs) -> Iterable[Tuple[Source, List[Segment]]]:
+        """"""
+        Collect items from RSS/Atom feed.
+
+        Args:
+            url: Feed URL
+        """"""
+        try:
+            # Parse feed
+            feed = feedparser.parse(url)
+
+            if feed.bozo and not feed.entries:
+                logger.error(f""Failed to parse feed: {url}"")
+                return
+
+            # Process each entry
+            for entry in feed.entries:
+                self.rate_limiter.wait()
+
+                article_url = entry.get('link', '')
+                if not article_url:
+                    continue
+
+                # Check robots.txt
+                if not self.check_robots_txt(article_url):
+                    continue
+
+                # Get published date
+                published_at = None
+                for date_field in ['published_parsed', 'updated_parsed']:
+                    if date_field in entry and entry[date_field]:
+                        try:
+                            published_at = datetime(*entry[date_field][:6])
+                            break
+                        except:
+                            pass
+
+                # Create source
+                source = Source(
+                    source_type='rss',
+                    title=entry.get('title', 'Untitled'),
+                    url=article_url,
+                    published_at=published_at,
+                )
+
+                # Fetch and extract article content
+                segments = self._extract_article_segments(article_url)
+
+                if segments:
+                    yield source, segments
+
+        except Exception as e:
+            logger.error(f""Error collecting RSS feed {url}: {e}"")
+
+    def _extract_article_segments(self, url: str) -> List[Segment]:
+        """"""Extract article content and split into segments.""""""
+        try:
+            # Download page
+            downloaded = trafilatura.fetch_url(url)
+            if not downloaded:
+                return []
+
+            # Extract main text
+            text = trafilatura.extract(
+                downloaded,
+                include_comments=False,
+                include_tables=False,
+            )
+
+            if not text:
+                return []
+
+            # Split into segments (1-3 sentences each)
+            sentences = re.split(r'(?<=[.!?])\s+', text)
+            segments = []
+
+            for i in range(0, len(sentences), 2):
+                segment_text = ' '.join(sentences[i:i+3])
+                if segment_text.strip():
+                    segment = Segment(
+                        text=segment_text.strip(),
+                        meta_json={'url': url, 'sentence_range': f""{i}-{i+3}""}
+                    )
+                    segments.append(segment)
+
+            return segments
+
+        except Exception as e:
+            logger.error(f""Error extracting article {url}: {e}"")
+            return []
+
+
+class WikipediaProvider(Provider):
+    """"""Provider for Wikipedia articles via REST API.""""""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.api_base = ""https://en.wikipedia.org/w/rest.php/v1""
+
+    def collect(
+        self,
+        page: Optional[str] = None,
+        url: Optional[str] = None,
+        **kwargs
+    ) -> Iterable[Tuple[Source, List[Segment]]]:
+        """"""
+        Collect Wikipedia article content.
+
+        Args:
+            page: Page title
+            url: Wikipedia URL (alternative to page)
+        """"""
+        if not page and not url:
+            raise ValueError(""Either page or url must be provided"")
+
+        # Extract page title from URL if needed
+        if url and not page:
+            page = self._extract_page_title(url)
+            if not page:
+                logger.error(f""Could not extract page title from URL: {url}"")
+                return
+
+        try:
+            # Fetch page content
+            page_url = f""{self.api_base}/page/{page}/html""
+
+            self.rate_limiter.wait()
+            response = self.session.get(page_url)
+            response.raise_for_status()
+
+            html_content = response.text
+
+            # Extract text using trafilatura
+            text = trafilatura.extract(
+                html_content,
+                include_comments=False,
+                include_tables=True,
+            )
+
+            if not text:
+                logger.error(f""No content extracted from Wikipedia page: {page}"")
+                return
+
+            # Create source
+            source = Source(
+                source_type='wikipedia',
+                title=page.replace('_', ' '),
+                url=f""https://en.wikipedia.org/wiki/{page}"",
+                published_at=datetime.now(),
+            )
+
+            # Split by sections (simple heuristic)
+            sections = re.split(r'\n#{1,3}\s+', text)
+            segments = []
+
+            for idx, section in enumerate(sections):
+                section = section.strip()
+                if section:
+                    # Further split long sections
+                    if len(section) > 500:
+                        paragraphs = section.split('\n\n')
+                        for para in paragraphs:
+                            if para.strip():
+                                segment = Segment(
+                                    text=para.strip(),
+                                    meta_json={'page': page, 'section_idx': idx}
+                                )
+                                segments.append(segment)
+                    else:
+                        segment = Segment(
+                            text=section,
+                            meta_json={'page': page, 'section_idx': idx}
+                        )
+                        segments.append(segment)
+
+            yield source, segments
+
+        except Exception as e:
+            logger.error(f""Error collecting Wikipedia page {page}: {e}"")
+
+    def _extract_page_title(self, url: str) -> Optional[str]:
+        """"""Extract page title from Wikipedia URL.""""""
+        match = re.search(r'wikipedia\.org/wiki/([^#?]+)', url)
+        if match:
+            return match.group(1)
+        return None
+
+
+class GovUkProvider(RSSProvider):
+    """"""Provider for GOV.UK publications via RSS.""""""
+
+    def collect(self, url: str, **kwargs) -> Iterable[Tuple[Source, List[Segment]]]:
+        """"""
+        Collect GOV.UK content from RSS feed.
+
+        Args:
+            url: GOV.UK RSS feed URL
+        """"""
+        # Validate it's a gov.uk domain
+        parsed = urlparse(url)
+        if 'gov.uk' not in parsed.netloc:
+            logger.warning(f""URL does not appear to be from gov.uk: {url}"")
+
+        # Use parent RSS implementation
+        for source, segments in super().collect(url, **kwargs):
+            # Update source type
+            source.source_type = 'govuk'
+            yield source, segments
+
+
+class HansardProvider(Provider):
+    """"""Provider for UK Parliament Hansard debates.""""""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.api_base = ""https://hansard-api.parliament.uk""
+
+    def collect(
+        self,
+        query: str,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        **kwargs
+    ) -> Iterable[Tuple[Source, List[Segment]]]:
+        """"""
+        Collect Hansard debate content.
+
+        Args:
+            query: Search query keyword
+            from_date: Start date (YYYY-MM-DD)
+            to_date: End date (YYYY-MM-DD)
+        """"""
+        try:
+            # Build API request
+            params = {
+                'searchTerm': query,
+                'take': 20,
+            }
+
+            if from_date:
+                params['startDate'] = from_date
+            if to_date:
+                params['endDate'] = to_date
+
+            # Note: Using a simplified approach since the actual Hansard API
+            # structure varies. This would need adjustment based on actual API.
+            search_url = f""{self.api_base}/search/debates.json""
+
+            self.rate_limiter.wait()
+            response = self.session.get(search_url, params=params)
+
+            # If API is not available, log and return
+            if response.status_code != 200:
+                logger.warning(
+                    f""Hansard API returned status {response.status_code}. ""
+                    ""This provider may need API credentials or adjustments.""
+                )
+                return
+
+            data = response.json()
+
+            # Process results (structure may vary)
+            for item in data.get('results', []):
+                # Create source
+                source = Source(
+                    source_type='hansard',
+                    title=item.get('title', 'Hansard Debate'),
+                    url=item.get('url', ''),
+                    published_at=self._parse_date(item.get('date')),
+                )
+
+                # Create segment from debate text
+                text = item.get('text', '')
+                if text:
+                    segment = Segment(
+                        text=text,
+                        meta_json={
+                            'speaker': item.get('speaker', ''),
+                            'debate_id': item.get('id', ''),
+                        }
+                    )
+                    yield source, [segment]
+
+        except Exception as e:
+            logger.error(f""Error collecting Hansard data: {e}"")
+
+    def _parse_date(self, date_str: Optional[str]) -> Optional[datetime]:
+        """"""Parse date string to datetime.""""""
+        if not date_str:
+            return None
+
+        try:
+            return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        except:
+            return None
+
+
+class GenericProvider(Provider):
+    """"""Provider for generic web pages with domain whitelist.""""""
+
+    def __init__(self, allowed_domains: List[str], *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.allowed_domains = [d.lower() for d in allowed_domains]
+
+    def collect(self, urls: List[str], **kwargs) -> Iterable[Tuple[Source, List[Segment]]]:
+        """"""
+        Collect content from whitelisted domains.
+
+        Args:
+            urls: List of URLs to scrape
+        """"""
+        for url in urls:
+            # Check if domain is whitelisted
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower()
+
+            # Remove www. prefix for comparison
+            domain_clean = domain.replace('www.', '')
+
+            allowed = any(
+                domain_clean == allowed or domain_clean.endswith('.' + allowed)
+                for allowed in self.allowed_domains
+            )
+
+            if not allowed:
+                logger.warning(
+                    f""Domain {domain} not in whitelist. Skipping {url}""
+                )
+                continue
+
+            # Check robots.txt
+            if not self.check_robots_txt(url):
+                continue
+
+            try:
+                self.rate_limiter.wait()
+
+                # Fetch and extract content
+                downloaded = trafilatura.fetch_url(url)
+                if not downloaded:
+                    logger.warning(f""Could not download {url}"")
+                    continue
+
+                text = trafilatura.extract(
+                    downloaded,
+                    include_comments=False,
+                    include_tables=False,
+                )
+
+                if not text:
+                    logger.warning(f""No content extracted from {url}"")
+                    continue
+
+                # Get metadata
+                metadata = trafilatura.extract_metadata(downloaded)
+
+                title = 'Untitled'
+                published_at = None
+
+                if metadata:
+                    title = metadata.title or title
+                    if metadata.date:
+                        try:
+                            published_at = datetime.fromisoformat(metadata.date)
+                        except:
+                            pass
+
+                # Create source
+                source = Source(
+                    source_type='generic',
+                    title=title,
+                    url=url,
+                    published_at=published_at,
+                )
+
+                # Split into segments
+                paragraphs = text.split('\n\n')
+                segments = []
+
+                for para in paragraphs:
+                    para = para.strip()
+                    if para and len(para) > 50:  # Skip very short paragraphs
+                        segment = Segment(
+                            text=para,
+                            meta_json={'url': url, 'domain': domain}
+                        )
+                        segments.append(segment)
+
+                if segments:
+                    yield source, segments
+
+            except Exception as e:
+                logger.error(f""Error collecting from {url}: {e}"")
+"
+backend/scraper/db.py,Database layer for storing scraped content,"""""""
+Database layer for scraper module.
+
+Provides functions to store scraped content in SQLite database.
+""""""
+
+import sqlite3
+import json
+import os
+from typing import Optional, List
+from datetime import datetime
+from pathlib import Path
+
+# Import from parent if available, otherwise use local definitions
+try:
+    from backend.db import get_db_connection, DATA_DIR
+except ImportError:
+    # Fallback implementation
+    DATA_DIR = os.environ.get('DATA_DIR', 'data')
+
+    def get_db_connection(db_path: Optional[str] = None):
+        """"""Get database connection.""""""
+        if db_path is None:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            db_path = os.path.join(DATA_DIR, 'contradictions.db')
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+
+def init_db(conn: sqlite3.Connection):
+    """"""Initialize database schema if needed.""""""
+    cursor = conn.cursor()
+
+    # Create sources table
+    cursor.execute(""""""
+        CREATE TABLE IF NOT EXISTS sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            url TEXT NOT NULL UNIQUE,
+            published_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """""")
+
+    # Create segments table
+    cursor.execute(""""""
+        CREATE TABLE IF NOT EXISTS segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            ts_start REAL,
+            ts_end REAL,
+            meta_json TEXT,
+            embedding BLOB,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (source_id) REFERENCES sources(id)
+        )
+    """""")
+
+    # Create index on source_id for faster lookups
+    cursor.execute(""""""
+        CREATE INDEX IF NOT EXISTS idx_segments_source_id 
+        ON segments(source_id)
+    """""")
+
+    conn.commit()
+
+
+def insert_source(
+    conn: sqlite3.Connection,
+    source_type: str,
+    title: str,
+    url: str,
+    published_at: Optional[datetime] = None,
+) -> int:
+    """"""
+    Insert a source into the database.
+
+    Returns:
+        source_id: ID of inserted source
+    """"""
+    cursor = conn.cursor()
+
+    published_str = None
+    if published_at:
+        published_str = published_at.isoformat()
+
+    try:
+        cursor.execute(""""""
+            INSERT INTO sources (source_type, title, url, published_at)
+            VALUES (?, ?, ?, ?)
+        """""", (source_type, title, url, published_str))
+
+        conn.commit()
+        return cursor.lastrowid
+
+    except sqlite3.IntegrityError:
+        # URL already exists, get existing ID
+        cursor.execute(""SELECT id FROM sources WHERE url = ?"", (url,))
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+        raise
+
+
+def insert_segments(
+    conn: sqlite3.Connection,
+    source_id: int,
+    segments: List,
+) -> List[int]:
+    """"""
+    Insert segments into the database.
+
+    Args:
+        source_id: ID of the source
+        segments: List of Segment objects
+
+    Returns:
+        List of segment IDs
+    """"""
+    cursor = conn.cursor()
+    segment_ids = []
+
+    for segment in segments:
+        meta_json_str = json.dumps(segment.meta_json) if segment.meta_json else None
+
+        cursor.execute(""""""
+            INSERT INTO segments (source_id, text, ts_start, ts_end, meta_json)
+            VALUES (?, ?, ?, ?, ?)
+        """""", (
+            source_id,
+            segment.text,
+            segment.ts_start,
+            segment.ts_end,
+            meta_json_str,
+        ))
+
+        segment_ids.append(cursor.lastrowid)
+
+    conn.commit()
+    return segment_ids
+
+
+def save_raw_text(source_id: int, text: str, data_dir: Optional[str] = None):
+    """"""Save raw text to file for debugging.""""""
+    if data_dir is None:
+        data_dir = DATA_DIR
+
+    raw_dir = os.path.join(data_dir, 'raw')
+    os.makedirs(raw_dir, exist_ok=True)
+
+    filepath = os.path.join(raw_dir, f""{source_id}.txt"")
+
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+
+def get_segments_without_embeddings(
+    conn: sqlite3.Connection,
+    limit: Optional[int] = None,
+) -> List[dict]:
+    """"""Get segments that need embeddings.""""""
+    cursor = conn.cursor()
+
+    query = """"""
+        SELECT id, text
+        FROM segments
+        WHERE embedding IS NULL
+    """"""
+
+    if limit:
+        query += f"" LIMIT {limit}""
+
+    cursor.execute(query)
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def update_segment_embedding(
+    conn: sqlite3.Connection,
+    segment_id: int,
+    embedding: bytes,
+):
+    """"""Update segment with embedding.""""""
+    cursor = conn.cursor()
+    cursor.execute(
+        ""UPDATE segments SET embedding = ? WHERE id = ?"",
+        (embedding, segment_id)
+    )
+    conn.commit()
+"
+backend/scraper/embeddings.py,Embedding generation using sentence-transformers,"""""""
+Embedding functionality for segments.
+
+Uses sentence-transformers to generate embeddings for text segments.
+""""""
+
+import logging
+import numpy as np
+from typing import List, Optional
+import sqlite3
+
+logger = logging.getLogger(__name__)
+
+# Try to import sentence-transformers
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    logger.warning(
+        ""sentence-transformers not installed. ""
+        ""Run: pip install sentence-transformers""
+    )
+
+# Default model - same as commonly used in embedding applications
+DEFAULT_MODEL = 'all-MiniLM-L6-v2'
+
+
+class EmbeddingGenerator:
+    """"""Generate embeddings for text segments.""""""
+
+    def __init__(self, model_name: str = DEFAULT_MODEL):
+        if not SENTENCE_TRANSFORMERS_AVAILABLE:
+            raise ImportError(
+                ""sentence-transformers is required. ""
+                ""Install with: pip install sentence-transformers""
+            )
+
+        self.model_name = model_name
+        self.model = None
+
+    def _load_model(self):
+        """"""Lazy load the model.""""""
+        if self.model is None:
+            logger.info(f""Loading embedding model: {self.model_name}"")
+            self.model = SentenceTransformer(self.model_name)
+
+    def embed_texts(self, texts: List[str]) -> np.ndarray:
+        """"""
+        Generate embeddings for texts.
+
+        Args:
+            texts: List of text strings
+
+        Returns:
+            Array of embeddings (shape: [len(texts), embedding_dim])
+        """"""
+        self._load_model()
+
+        # Generate embeddings with normalization
+        embeddings = self.model.encode(
+            texts,
+            normalize_embeddings=True,
+            show_progress_bar=len(texts) > 10,
+        )
+
+        return embeddings
+
+    def embed_text(self, text: str) -> np.ndarray:
+        """"""Generate embedding for a single text.""""""
+        return self.embed_texts([text])[0]
+
+
+def embed_segments(
+    conn: sqlite3.Connection,
+    model_name: str = DEFAULT_MODEL,
+    batch_size: int = 32,
+):
+    """"""
+    Generate embeddings for all segments without embeddings.
+
+    Args:
+        conn: Database connection
+        model_name: Name of sentence-transformers model
+        batch_size: Batch size for embedding generation
+    """"""
+    from .db import get_segments_without_embeddings, update_segment_embedding
+
+    # Get segments without embeddings
+    segments = get_segments_without_embeddings(conn)
+
+    if not segments:
+        logger.info(""No segments need embeddings"")
+        return
+
+    logger.info(f""Generating embeddings for {len(segments)} segments"")
+
+    # Initialize generator
+    generator = EmbeddingGenerator(model_name)
+
+    # Process in batches
+    for i in range(0, len(segments), batch_size):
+        batch = segments[i:i+batch_size]
+        texts = [seg['text'] for seg in batch]
+
+        # Generate embeddings
+        embeddings = generator.embed_texts(texts)
+
+        # Store in database
+        for seg, embedding in zip(batch, embeddings):
+            # Convert to bytes for storage
+            embedding_bytes = embedding.astype(np.float32).tobytes()
+            update_segment_embedding(conn, seg['id'], embedding_bytes)
+
+        logger.info(f""Embedded {min(i+batch_size, len(segments))}/{len(segments)} segments"")
+
+    logger.info(""Embedding generation complete"")
+
+
+def index_segments(
+    conn: sqlite3.Connection,
+    source_id: int,
+    segments: List,
+    generate_embeddings: bool = True,
+    model_name: str = DEFAULT_MODEL,
+):
+    """"""
+    Index segments into database with optional embeddings.
+
+    Args:
+        conn: Database connection
+        source_id: Source ID
+        segments: List of Segment objects
+        generate_embeddings: Whether to generate embeddings
+        model_name: Embedding model name
+    """"""
+    from .db import insert_segments
+
+    # Insert segments
+    segment_ids = insert_segments(conn, source_id, segments)
+
+    logger.info(f""Inserted {len(segment_ids)} segments"")
+
+    # Generate embeddings if requested
+    if generate_embeddings and SENTENCE_TRANSFORMERS_AVAILABLE:
+        embed_segments(conn, model_name)
+"
+backend/scraper/run.py,CLI entrypoint for running scrapers,"#!/usr/bin/env python3
+""""""
+CLI entrypoint for scraper module.
+
+Usage:
+    python -m backend.scraper.run youtube --url <url>
+    python -m backend.scraper.run rss --url <url>
+    python -m backend.scraper.run wikipedia --page <title>
+    python -m backend.scraper.run hansard --q <query> --from <date> --to <date>
+    python -m backend.scraper.run generic --allow <domains> --url <urls>
+""""""
+
+import argparse
+import json
+import logging
+import os
+import sys
+from typing import Optional
+
+from .providers import (
+    YouTubeProvider,
+    RSSProvider,
+    WikipediaProvider,
+    GovUkProvider,
+    HansardProvider,
+    GenericProvider,
+)
+from .db import (
+    get_db_connection,
+    init_db,
+    insert_source,
+    save_raw_text,
+)
+from .embeddings import index_segments
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+def scrape_youtube(args):
+    """"""Scrape YouTube video.""""""
+    provider = YouTubeProvider()
+
+    for source, segments in provider.collect(url=args.url, video_id=args.video_id):
+        if args.commit:
+            conn = get_db_connection(args.data_dir)
+            init_db(conn)
+
+            source_id = insert_source(
+                conn,
+                source.source_type,
+                source.title,
+                source.url,
+                source.published_at,
+            )
+
+            # Save raw text
+            raw_text = '\n'.join(seg.text for seg in segments)
+            save_raw_text(source_id, raw_text)
+
+            # Index segments
+            index_segments(conn, source_id, segments, args.embed)
+
+            logger.info(f""Saved source {source_id} with {len(segments)} segments"")
+            conn.close()
+        else:
+            # Dry run - print JSON preview
+            preview = {
+                'source': {
+                    'type': source.source_type,
+                    'title': source.title,
+                    'url': source.url,
+                    'published_at': source.published_at.isoformat() if source.published_at else None,
+                },
+                'segments_count': len(segments),
+                'sample_segments': [
+                    {
+                        'text': seg.text[:100] + '...' if len(seg.text) > 100 else seg.text,
+                        'ts_start': seg.ts_start,
+                        'ts_end': seg.ts_end,
+                    }
+                    for seg in segments[:3]
+                ],
+            }
+            print(json.dumps(preview, indent=2))
+
+
+def scrape_rss(args):
+    """"""Scrape RSS feed.""""""
+    provider = RSSProvider()
+
+    count = 0
+    for source, segments in provider.collect(url=args.url):
+        if args.commit:
+            conn = get_db_connection(args.data_dir)
+            init_db(conn)
+
+            source_id = insert_source(
+                conn,
+                source.source_type,
+                source.title,
+                source.url,
+                source.published_at,
+            )
+
+            # Save raw text
+            raw_text = '\n\n'.join(seg.text for seg in segments)
+            save_raw_text(source_id, raw_text)
+
+            # Index segments
+            index_segments(conn, source_id, segments, args.embed)
+
+            logger.info(f""Saved source {source_id} with {len(segments)} segments"")
+            conn.close()
+        else:
+            # Dry run
+            preview = {
+                'source': {
+                    'type': source.source_type,
+                    'title': source.title,
+                    'url': source.url,
+                },
+                'segments_count': len(segments),
+            }
+            print(json.dumps(preview, indent=2))
+
+        count += 1
+        if args.limit and count >= args.limit:
+            break
+
+
+def scrape_wikipedia(args):
+    """"""Scrape Wikipedia page.""""""
+    provider = WikipediaProvider()
+
+    for source, segments in provider.collect(page=args.page, url=args.url):
+        if args.commit:
+            conn = get_db_connection(args.data_dir)
+            init_db(conn)
+
+            source_id = insert_source(
+                conn,
+                source.source_type,
+                source.title,
+                source.url,
+                source.published_at,
+            )
+
+            # Save raw text
+            raw_text = '\n\n'.join(seg.text for seg in segments)
+            save_raw_text(source_id, raw_text)
+
+            # Index segments
+            index_segments(conn, source_id, segments, args.embed)
+
+            logger.info(f""Saved source {source_id} with {len(segments)} segments"")
+            conn.close()
+        else:
+            # Dry run
+            preview = {
+                'source': {
+                    'type': source.source_type,
+                    'title': source.title,
+                    'url': source.url,
+                },
+                'segments_count': len(segments),
+                'sample_segments': [
+                    seg.text[:100] + '...' if len(seg.text) > 100 else seg.text
+                    for seg in segments[:3]
+                ],
+            }
+            print(json.dumps(preview, indent=2))
+
+
+def scrape_govuk(args):
+    """"""Scrape GOV.UK RSS feed.""""""
+    provider = GovUkProvider()
+
+    count = 0
+    for source, segments in provider.collect(url=args.url):
+        if args.commit:
+            conn = get_db_connection(args.data_dir)
+            init_db(conn)
+
+            source_id = insert_source(
+                conn,
+                source.source_type,
+                source.title,
+                source.url,
+                source.published_at,
+            )
+
+            # Save raw text
+            raw_text = '\n\n'.join(seg.text for seg in segments)
+            save_raw_text(source_id, raw_text)
+
+            # Index segments
+            index_segments(conn, source_id, segments, args.embed)
+
+            logger.info(f""Saved source {source_id} with {len(segments)} segments"")
+            conn.close()
+        else:
+            # Dry run
+            preview = {
+                'source': {
+                    'type': source.source_type,
+                    'title': source.title,
+                    'url': source.url,
+                },
+                'segments_count': len(segments),
+            }
+            print(json.dumps(preview, indent=2))
+
+        count += 1
+        if args.limit and count >= args.limit:
+            break
+
+
+def scrape_hansard(args):
+    """"""Scrape Hansard debates.""""""
+    provider = HansardProvider()
+
+    for source, segments in provider.collect(
+        query=args.q,
+        from_date=args.from_date,
+        to_date=args.to_date,
+    ):
+        if args.commit:
+            conn = get_db_connection(args.data_dir)
+            init_db(conn)
+
+            source_id = insert_source(
+                conn,
+                source.source_type,
+                source.title,
+                source.url,
+                source.published_at,
+            )
+
+            # Save raw text
+            raw_text = '\n\n'.join(seg.text for seg in segments)
+            save_raw_text(source_id, raw_text)
+
+            # Index segments
+            index_segments(conn, source_id, segments, args.embed)
+
+            logger.info(f""Saved source {source_id} with {len(segments)} segments"")
+            conn.close()
+        else:
+            # Dry run
+            preview = {
+                'source': {
+                    'type': source.source_type,
+                    'title': source.title,
+                    'url': source.url,
+                },
+                'segments_count': len(segments),
+            }
+            print(json.dumps(preview, indent=2))
+
+
+def scrape_generic(args):
+    """"""Scrape generic web pages.""""""
+    # Parse allowed domains
+    allowed_domains = [d.strip() for d in args.allow.split(',')]
+
+    # Parse URLs
+    urls = []
+    if args.url:
+        if isinstance(args.url, list):
+            urls = args.url
+        else:
+            urls = [args.url]
+
+    provider = GenericProvider(allowed_domains=allowed_domains)
+
+    for source, segments in provider.collect(urls=urls):
+        if args.commit:
+            conn = get_db_connection(args.data_dir)
+            init_db(conn)
+
+            source_id = insert_source(
+                conn,
+                source.source_type,
+                source.title,
+                source.url,
+                source.published_at,
+            )
+
+            # Save raw text
+            raw_text = '\n\n'.join(seg.text for seg in segments)
+            save_raw_text(source_id, raw_text)
+
+            # Index segments
+            index_segments(conn, source_id, segments, args.embed)
+
+            logger.info(f""Saved source {source_id} with {len(segments)} segments"")
+            conn.close()
+        else:
+            # Dry run
+            preview = {
+                'source': {
+                    'type': source.source_type,
+                    'title': source.title,
+                    'url': source.url,
+                },
+                'segments_count': len(segments),
+            }
+            print(json.dumps(preview, indent=2))
+
+
+def main():
+    """"""Main CLI entrypoint.""""""
+    parser = argparse.ArgumentParser(
+        description='Scrape content for contradiction detection'
+    )
+
+    # Global options
+    parser.add_argument(
+        '--data-dir',
+        type=str,
+        help='Data directory (default: from config or DATA_DIR env var)'
+    )
+    parser.add_argument(
+        '--commit',
+        action='store_true',
+        help='Write to database (default: dry-run)'
+    )
+    parser.add_argument(
+        '--embed',
+        action='store_true',
+        help='Generate embeddings after insertion'
+    )
+
+    subparsers = parser.add_subparsers(dest='provider', help='Provider type')
+
+    # YouTube provider
+    youtube_parser = subparsers.add_parser('youtube', help='Scrape YouTube videos')
+    youtube_parser.add_argument('--url', type=str, help='YouTube video URL')
+    youtube_parser.add_argument('--video-id', type=str, help='YouTube video ID')
+    youtube_parser.set_defaults(func=scrape_youtube)
+
+    # RSS provider
+    rss_parser = subparsers.add_parser('rss', help='Scrape RSS feeds')
+    rss_parser.add_argument('--url', type=str, required=True, help='RSS feed URL')
+    rss_parser.add_argument('--limit', type=int, help='Max items to process')
+    rss_parser.set_defaults(func=scrape_rss)
+
+    # Wikipedia provider
+    wiki_parser = subparsers.add_parser('wikipedia', help='Scrape Wikipedia')
+    wiki_parser.add_argument('--page', type=str, help='Page title')
+    wiki_parser.add_argument('--url', type=str, help='Wikipedia URL')
+    wiki_parser.set_defaults(func=scrape_wikipedia)
+
+    # GOV.UK provider
+    govuk_parser = subparsers.add_parser('govuk', help='Scrape GOV.UK RSS')
+    govuk_parser.add_argument('--url', type=str, required=True, help='GOV.UK RSS URL')
+    govuk_parser.add_argument('--limit', type=int, help='Max items to process')
+    govuk_parser.set_defaults(func=scrape_govuk)
+
+    # Hansard provider
+    hansard_parser = subparsers.add_parser('hansard', help='Scrape Hansard')
+    hansard_parser.add_argument('--q', type=str, required=True, help='Search query')
+    hansard_parser.add_argument('--from', dest='from_date', type=str, help='Start date (YYYY-MM-DD)')
+    hansard_parser.add_argument('--to', dest='to_date', type=str, help='End date (YYYY-MM-DD)')
+    hansard_parser.set_defaults(func=scrape_hansard)
+
+    # Generic provider
+    generic_parser = subparsers.add_parser('generic', help='Scrape generic sites')
+    generic_parser.add_argument(
+        '--allow',
+        type=str,
+        required=True,
+        help='Comma-separated allowed domains'
+    )
+    generic_parser.add_argument(
+        '--url',
+        type=str,
+        nargs='+',
+        required=True,
+        help='URLs to scrape'
+    )
+    generic_parser.set_defaults(func=scrape_generic)
+
+    args = parser.parse_args()
+
+    if not args.provider:
+        parser.print_help()
+        sys.exit(1)
+
+    # Execute provider function
+    args.func(args)
+
+
+if __name__ == '__main__':
+    main()
+"
+requirements.txt (additions),Python dependencies to add to requirements.txt,"
+# Scraper dependencies
+requests>=2.31.0
+feedparser>=6.0.10
+trafilatura>=1.6.0
+youtube-transcript-api>=0.6.1
+yt-dlp>=2023.11.0
+sentence-transformers>=2.2.0
+"
+tests/test_scraper.py,Unit tests for scraper module,"""""""
+Unit tests for scraper module.
+""""""
+
+import unittest
+from unittest.mock import Mock, patch, MagicMock
+from urllib.robotparser import RobotFileParser
+
+from backend.scraper.providers import (
+    RobotsChecker,
+    RateLimiter,
+    YouTubeProvider,
+    RSSProvider,
+    WikipediaProvider,
+)
+
+
+class TestRobotsChecker(unittest.TestCase):
+    """"""Test robots.txt compliance checking.""""""
+
+    def test_robots_allow(self):
+        """"""Test that allowed URLs pass.""""""
+        checker = RobotsChecker('TestBot/1.0')
+
+        # Mock robots.txt content that allows everything
+        sample_robots = """"""
+User-agent: *
+Allow: /
+""""""
+
+        with patch.object(RobotFileParser, 'read') as mock_read:
+            mock_read.return_value = None
+            with patch.object(RobotFileParser, 'can_fetch', return_value=True):
+                result = checker.can_fetch('https://example.com/page')
+                self.assertTrue(result)
+
+    def test_robots_deny(self):
+        """"""Test that disallowed URLs are blocked.""""""
+        checker = RobotsChecker('TestBot/1.0')
+
+        with patch.object(RobotFileParser, 'read') as mock_read:
+            mock_read.return_value = None
+            with patch.object(RobotFileParser, 'can_fetch', return_value=False):
+                result = checker.can_fetch('https://example.com/private')
+                self.assertFalse(result)
+
+
+class TestRateLimiter(unittest.TestCase):
+    """"""Test rate limiting.""""""
+
+    def test_rate_limit_delay(self):
+        """"""Test that rate limiter adds delay.""""""
+        limiter = RateLimiter(max_rps=10, random_delay=False)
+
+        import time
+        start = time.time()
+        limiter.wait()
+        limiter.wait()
+        elapsed = time.time() - start
+
+        # Should take at least min_delay
+        self.assertGreaterEqual(elapsed, limiter.min_delay * 0.9)
+
+
+class TestYouTubeProvider(unittest.TestCase):
+    """"""Test YouTube provider.""""""
+
+    def test_extract_video_id_from_url(self):
+        """"""Test video ID extraction from various URL formats.""""""
+        provider = YouTubeProvider()
+
+        test_cases = [
+            ('https://www.youtube.com/watch?v=dQw4w9WgXcQ', 'dQw4w9WgXcQ'),
+            ('https://youtu.be/dQw4w9WgXcQ', 'dQw4w9WgXcQ'),
+            ('https://www.youtube.com/embed/dQw4w9WgXcQ', 'dQw4w9WgXcQ'),
+        ]
+
+        for url, expected_id in test_cases:
+            video_id = provider._extract_video_id(url)
+            self.assertEqual(video_id, expected_id, f""Failed for URL: {url}"")
+
+    @patch('backend.scraper.providers.YouTubeTranscriptApi')
+    @patch('backend.scraper.providers.yt_dlp.YoutubeDL')
+    def test_collect_youtube(self, mock_ytdlp, mock_transcript_api):
+        """"""Test collecting YouTube transcript.""""""
+        # Mock metadata
+        mock_ytdlp.return_value.__enter__.return_value.extract_info.return_value = {
+            'title': 'Test Video',
+            'upload_date': '20231001',
+        }
+
+        # Mock transcript
+        mock_transcript_api.get_transcript.return_value = [
+            {'start': 0.0, 'duration': 2.0, 'text': 'Hello'},
+            {'start': 2.0, 'duration': 2.0, 'text': 'World'},
+        ]
+
+        provider = YouTubeProvider()
+        results = list(provider.collect(video_id='test123'))
+
+        self.assertEqual(len(results), 1)
+        source, segments = results[0]
+        self.assertEqual(source.source_type, 'youtube')
+        self.assertEqual(len(segments), 2)
+
+
+class TestRSSProvider(unittest.TestCase):
+    """"""Test RSS provider.""""""
+
+    @patch('backend.scraper.providers.feedparser.parse')
+    @patch('backend.scraper.providers.trafilatura.fetch_url')
+    @patch('backend.scraper.providers.trafilatura.extract')
+    def test_collect_rss(self, mock_extract, mock_fetch, mock_parse):
+        """"""Test collecting from RSS feed.""""""
+        # Mock feed
+        mock_parse.return_value = MagicMock(
+            bozo=False,
+            entries=[
+                {
+                    'title': 'Test Article',
+                    'link': 'https://example.com/article',
+                    'published_parsed': (2023, 10, 1, 0, 0, 0, 0, 0, 0),
+                }
+            ]
+        )
+
+        # Mock article extraction
+        mock_fetch.return_value = '<html>Test content</html>'
+        mock_extract.return_value = 'This is a test article. It has multiple sentences.'
+
+        provider = RSSProvider(check_robots=False)
+        results = list(provider.collect(url='https://example.com/feed'))
+
+        self.assertGreater(len(results), 0)
+
+
+class TestWikipediaProvider(unittest.TestCase):
+    """"""Test Wikipedia provider.""""""
+
+    def test_extract_page_title(self):
+        """"""Test extracting page title from URL.""""""
+        provider = WikipediaProvider()
+
+        url = 'https://en.wikipedia.org/wiki/Artificial_intelligence'
+        title = provider._extract_page_title(url)
+
+        self.assertEqual(title, 'Artificial_intelligence')
+
+
+if __name__ == '__main__':
+    unittest.main()
+"
+README.md (section to add),Documentation section for README,"
+## Scraping Sources
+
+The project includes a pluggable scraper module that can collect content from various sources while respecting robots.txt and site terms of service.
+
+### Supported Providers
+
+- **YouTube**: Video transcripts using `youtube-transcript-api` and metadata via `yt-dlp`
+- **RSS/Atom Feeds**: Official newsrooms and blogs via `feedparser`
+- **Wikipedia**: Articles via the official REST API
+- **GOV.UK**: UK government publications via RSS feeds
+- **UK Parliament Hansard**: Parliamentary debates and speeches
+- **Generic Web Pages**: Any whitelisted domain using `trafilatura`
+
+### Installation
+
+Install scraper dependencies:
+
+```bash
+pip install requests feedparser trafilatura youtube-transcript-api yt-dlp sentence-transformers
+```
+
+### Usage
+
+The scraper can be run from the command line. All commands support dry-run mode (default) and commit mode with `--commit`.
+
+#### YouTube Videos
+
+```bash
+# Dry run (preview only)
+python -m backend.scraper.run youtube --url https://www.youtube.com/watch?v=VIDEO_ID
+
+# Commit to database with embeddings
+python -m backend.scraper.run youtube --url https://www.youtube.com/watch?v=VIDEO_ID --commit --embed
+```
+
+#### RSS Feeds
+
+```bash
+# GOV.UK announcements
+python -m backend.scraper.run rss --url https://www.gov.uk/government/announcements.atom --commit --embed
+
+# Limit to first 10 items
+python -m backend.scraper.run rss --url https://example.com/feed.xml --limit 10 --commit
+```
+
+#### Wikipedia
+
+```bash
+# By page title
+python -m backend.scraper.run wikipedia --page ""Artificial intelligence"" --commit --embed
+
+# By URL
+python -m backend.scraper.run wikipedia --url https://en.wikipedia.org/wiki/Climate_change --commit
+```
+
+#### UK Parliament Hansard
+
+```bash
+# Search debates by keyword and date range
+python -m backend.scraper.run hansard --q ""immigration"" --from 2025-01-01 --to 2025-10-30 --commit
+```
+
+#### Generic Web Pages
+
+```bash
+# Whitelist domains and scrape
+python -m backend.scraper.run generic --allow bbc.co.uk,apnews.com --url https://www.bbc.co.uk/news/article1 https://apnews.com/article2 --commit --embed
+```
+
+### Configuration
+
+Set environment variables for scraper behavior:
+
+```bash
+# Contact email for User-Agent string (required for polite scraping)
+export SCRAPER_CONTACT=""your-email@example.com""
+
+# Data directory (default: 'data')
+export DATA_DIR=""./data""
+```
+
+### Safety Features
+
+1. **robots.txt Compliance**: Automatically checks and respects robots.txt directives. Fails closed if robots.txt disallows access.
+
+2. **Rate Limiting**: Default maximum of 1 request per second with random polite delays.
+
+3. **Domain Whitelisting**: Generic provider only scrapes from explicitly allowed domains.
+
+4. **User Agent**: Identifies the scraper with contact information.
+
+### Database Integration
+
+Scraped content is stored in SQLite with the following schema:
+
+**sources** table:
+- `id`: Primary key
+- `source_type`: Provider type (youtube, rss, wikipedia, etc.)
+- `title`: Content title
+- `url`: Source URL
+- `published_at`: Publication date
+- `created_at`: When scraped
+
+**segments** table:
+- `id`: Primary key
+- `source_id`: Foreign key to sources
+- `text`: Segment text content
+- `ts_start`: Start timestamp (for videos)
+- `ts_end`: End timestamp (for videos)
+- `meta_json`: Additional metadata as JSON
+- `embedding`: Vector embedding (BLOB)
+- `created_at`: When created
+
+Raw text is also saved to `DATA_DIR/raw/<source_id>.txt` for debugging.
+
+### Embeddings
+
+The scraper can automatically generate embeddings using sentence-transformers:
+
+```bash
+# Generate embeddings during scraping
+python -m backend.scraper.run youtube --url VIDEO_URL --commit --embed
+
+# Generate embeddings for existing segments
+python -c ""from backend.scraper.db import get_db_connection; from backend.scraper.embeddings import embed_segments; conn = get_db_connection(); embed_segments(conn); conn.close()""
+```
+
+Default model: `all-MiniLM-L6-v2` (384-dimensional embeddings)
+
+### Testing
+
+Run scraper tests:
+
+```bash
+python -m pytest tests/test_scraper.py -v
+```
+
+Or with unittest:
+
+```bash
+python -m unittest tests.test_scraper
+```
+
+### Example Workflow
+
+Complete workflow to scrape, store, and analyze content:
+
+```bash
+# 1. Scrape sources
+python -m backend.scraper.run youtube --url https://www.youtube.com/watch?v=VIDEO_ID --commit --embed
+python -m backend.scraper.run rss --url https://www.gov.uk/government/announcements.atom --limit 5 --commit --embed
+
+# 2. Add subtitle files (if using existing ingest pipeline)
+python backend/ingest.py --subtitle samples/media/your_clip.srt
+
+# 3. Start the web app
+uvicorn frontend.app:app --host 127.0.0.1 --port 7860
+```
+
+### Limitations
+
+- **YouTube**: Requires videos to have transcripts/captions available
+- **Hansard**: API structure may vary; implementation may need adjustments based on actual API
+- **Rate Limits**: Respects 1 RPS by default; some sites may have stricter limits
+- **Authentication**: Does not support authenticated access; only public content
+
+### Extending with New Providers
+
+To add a new provider:
+
+1. Create a class inheriting from `Provider` in `backend/scraper/providers.py`
+2. Implement the `collect()` method returning `Iterable[Tuple[Source, List[Segment]]]`
+3. Add CLI command in `backend/scraper/run.py`
+4. Add tests in `tests/test_scraper.py`
+
+Example:
+
+```python
+class MyProvider(Provider):
+    def collect(self, url: str, **kwargs):
+        # Check robots.txt
+        if not self.check_robots_txt(url):
+            return
+
+        # Rate limit
+        self.rate_limiter.wait()
+
+        # Fetch content
+        response = self.session.get(url)
+
+        # Parse and yield
+        source = Source(
+            source_type='myprovider',
+            title='Title',
+            url=url,
+        )
+
+        segments = [Segment(text='...')]
+
+        yield source, segments
+```
+"

@@ -16,6 +16,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from .config import REPO_ROOT, ensure_dirs, get_config
 
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -135,6 +136,7 @@ class NLIScorer:
     def _load_hf_backend(self):
         LOGGER.info("Loading NLI model with PyTorch: %s", self.model_name)
         tokenizer = self._load_tokenizer()
+
         model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
         model.eval()
         return _PytorchBackend(tokenizer=tokenizer, model=model)

@@ -22,6 +22,7 @@ from backend.transcribe import transcribe_audio
 from backend.scraper.providers import PROVIDERS
 from backend.scraper.run import run_scraper
 
+
 app = FastAPI(title="Hypocrisy Detector")
 
 ensure_dirs()
@@ -171,3 +172,4 @@ async def api_scrape(payload: ScrapeRequest):
     if payload.ingest:
         ingested = ingest_from_scraped_sqlite(out_path)
     return {"summary": summary, "sqlite": str(out_path.relative_to(REPO_ROOT)), "ingested": ingested}
+

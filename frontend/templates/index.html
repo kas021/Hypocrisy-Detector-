@@ -13,6 +13,7 @@
         <h1 class="text-3xl font-semibold tracking-tight">Hypocrisy Detector</h1>
         <p class="text-sm text-slate-400">
           Capture speech, upload transcripts, or paste text. Then run contradiction search against the curated corpus.
+
         </p>
       </div>
     </header>
@@ -21,6 +22,7 @@
       <section class="rounded-xl border border-slate-800 bg-slate-900/70 p-6 shadow-lg shadow-slate-950/40">
         <h2 class="text-xl font-semibold">1. Record speech</h2>
         <p class="mt-1 text-sm text-slate-400">Use your microphone to capture a short statement. Audio stays on this device.</p>
+
         <div class="mt-4 flex flex-wrap items-center gap-4">
           <button
             id="start-record"
@@ -168,6 +170,7 @@
       </section>
     </main>
 
+
     <script>
       const recordBtn = document.getElementById('start-record');
       const stopBtn = document.getElementById('stop-record');
@@ -190,6 +193,7 @@
 
       function setStatus(message) {
         statusEl.textContent = message;
+
       }
 
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -213,6 +217,7 @@
           recordBtn.disabled = true;
           stopBtn.disabled = false;
           setStatus('Recording...');
+
         } catch (error) {
           console.error(error);
           setStatus('Unable to access microphone.');
@@ -226,6 +231,7 @@
         recordBtn.disabled = false;
         stopBtn.disabled = true;
         setStatus('Processing audio...');
+
       });
 
       async function handleRecordingStop() {
@@ -246,6 +252,7 @@
           if (Array.isArray(data.segments) && data.segments.length) {
             textInput.value = data.segments.map((seg) => seg.text).join(' ');
             setStatus(`Transcribed ${data.segments.length} segments. Ingested ${data.ingested}.`);
+
           } else {
             setStatus('No speech detected.');
           }
@@ -442,6 +449,7 @@
         const m = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
         const s = String(total % 60).padStart(2, '0');
         return `${h}:${m}:${s}`;
+
       }
     </script>
   </body>

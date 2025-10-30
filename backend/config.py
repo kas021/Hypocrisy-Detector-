@@ -17,6 +17,7 @@ DEFAULTS: Dict[str, Any] = {
     "SAMPLE_DIR": "samples/media",
     "HF_NLI_MODEL": "cross-encoder/nli-deberta-v3-xsmall",
     "NLI_BACKEND": "hf",
+
 }
 
 
@@ -89,6 +90,7 @@ def ensure_dirs() -> Dict[str, Any]:
         path.mkdir(parents=True, exist_ok=True)
 
     samples_dir.mkdir(parents=True, exist_ok=True)
+
 
     return config
 
