@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
+
 
 
 @dataclass
@@ -31,6 +32,8 @@ class HypocrisyHit:
     url_or_path: str
     ts_start: Optional[float]
     ts_end: Optional[float]
+    extra: Dict | None = None
+
 
 
 __all__ = ["Source", "Segment", "HypocrisyHit"]

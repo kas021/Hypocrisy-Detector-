@@ -2,9 +2,15 @@
 from __future__ import annotations
 
 import json
-from typing import Iterable, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, Iterable, List, Optional, Tuple
 
-import numpy as np
+try:  # pragma: no cover - optional dependency for tests
+    import numpy as np
+except Exception:  # pragma: no cover - fallback path
+    np = None  # type: ignore
+
+
 from sqlite_utils import Database as SQLiteDatabase
 
 from .config import REPO_ROOT, ensure_dirs
@@ -21,29 +27,42 @@ class CorpusDatabase:
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
-        self.db.table("sources").create(
+        sources = self.db.table("sources")
+        sources.create(
+
             {
                 "id": int,
                 "title": str,
                 "source_type": str,
                 "url_or_path": str,
+                "published_at": str,
+                "author": str,
+                "extra_json": str,
+
             },
             pk="id",
             if_not_exists=True,
         )
-        self.db.table("sources").create_index(["url_or_path"], if_not_exists=True, unique=True)
-        self.db.table("segments").create(
+        sources.create_index(["url_or_path"], if_not_exists=True, unique=True)
+        segments = self.db.table("segments")
+        segments.create(
+
             {
                 "id": int,
                 "source_id": int,
                 "text": str,
                 "ts_start": float,
                 "ts_end": float,
+                "doc_id": str,
+
             },
             pk="id",
             if_not_exists=True,
         )
-        self.db.table("embeddings").create(
+        segments.create_index(["doc_id"], if_not_exists=True)
+        embeddings = self.db.table("embeddings")
+        embeddings.create(
+
             {
                 "segment_id": int,
                 "vector": str,
@@ -52,16 +71,46 @@ class CorpusDatabase:
             if_not_exists=True,
         )
 
-    def add_source(self, title: str, source_type: str, url_or_path: str) -> int:
+        # ensure optional columns exist when upgrading older databases
+        existing_cols = sources.columns_dict
+        if "published_at" not in existing_cols:
+            sources.add_column("published_at", str, default=None)
+        if "author" not in existing_cols:
+            sources.add_column("author", str, default=None)
+        if "extra_json" not in existing_cols:
+            sources.add_column("extra_json", str, default="{}")
+
+        segment_cols = segments.columns_dict
+        if "doc_id" not in segment_cols:
+            segments.add_column("doc_id", str, default=None)
+
+    def add_source(
+        self,
+        title: str,
+        source_type: str,
+        url_or_path: str,
+        *,
+        published_at: Optional[datetime] = None,
+        author: Optional[str] = None,
+        extra: Optional[Dict] = None,
+    ) -> int:
         table = self.db.table("sources")
         existing = list(table.rows_where("url_or_path = ?", [url_or_path], limit=1))
+        payload = {
+            "title": title,
+            "source_type": source_type,
+            "url_or_path": url_or_path,
+            "published_at": published_at.isoformat() if published_at else None,
+            "author": author,
+            "extra_json": json.dumps(extra or {}),
+        }
         if existing:
             source_id = existing[0]["id"]
-            table.update(source_id, {"title": title, "source_type": source_type})
+            table.update(source_id, payload)
             return int(source_id)
 
-        row = {"title": title, "source_type": source_type, "url_or_path": url_or_path}
-        source_id = table.insert(row, pk="id")
+        source_id = table.insert(payload, pk="id")
+
         return int(source_id)
 
     def add_segment(
@@ -71,6 +120,9 @@ class CorpusDatabase:
         ts_start: Optional[float],
         ts_end: Optional[float],
         embedding: Iterable[float],
+        *,
+        doc_id: Optional[str] = None,
+
     ) -> int:
         seg_table = self.db.table("segments")
         seg_id = seg_table.insert(
@@ -79,6 +131,8 @@ class CorpusDatabase:
                 "text": text,
                 "ts_start": ts_start,
                 "ts_end": ts_end,
+                "doc_id": doc_id,
+
             },
             pk="id",
         )
@@ -99,9 +153,17 @@ class CorpusDatabase:
         for row in seg_table.rows:
             try:
                 emb_row = emb_table.get(row["id"])
-                vector = np.array(json.loads(emb_row["vector"]), dtype="float32")
+                raw_vector = json.loads(emb_row["vector"])
+                if np is not None:
+                    vector = np.array(raw_vector, dtype="float32")
+                else:
+                    vector = [float(x) for x in raw_vector]
             except KeyError:
-                vector = np.zeros(384, dtype="float32")
+                if np is not None:
+                    vector = np.zeros(384, dtype="float32")
+                else:
+                    vector = [0.0] * 384
+
             segments.append(
                 (
                     Segment(

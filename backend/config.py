@@ -16,6 +16,8 @@ DEFAULTS: Dict[str, Any] = {
     "DATA_DIR": "data",
     "SAMPLE_DIR": "samples/media",
     "HF_NLI_MODEL": "cross-encoder/nli-deberta-v3-xsmall",
+    "NLI_BACKEND": "hf",
+
 }
 
 
@@ -81,9 +83,14 @@ def ensure_dirs() -> Dict[str, Any]:
     transcripts = data_dir / "transcripts"
     uploads = data_dir / "uploads"
     db_dir = data_dir / "db"
+    raw_dir = data_dir / "raw"
+    samples_dir = REPO_ROOT / config["SAMPLE_DIR"]
 
-    for path in (data_dir, transcripts, uploads, db_dir):
+    for path in (data_dir, transcripts, uploads, db_dir, raw_dir):
         path.mkdir(parents=True, exist_ok=True)
+
+    samples_dir.mkdir(parents=True, exist_ok=True)
+
 
     return config
 

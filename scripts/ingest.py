@@ -1,27 +1,17 @@
-"""Command-line wrapper for ingesting subtitle files."""
+"""Convenient wrapper around :mod:`backend.ingest`."""
 from __future__ import annotations
 
-import argparse
 import sys
-from pathlib import Path
 
-from backend.ingest import ingest_subtitle
+from backend.ingest import main as ingest_main
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Ingest subtitle transcripts into the database")
-    parser.add_argument(
-        "--subtitle",
-        default="samples/media/your_clip.srt",
-        help="Relative path to an SRT or VTT file (defaults to bundled sample)",
-    )
-    parser.add_argument("--title", help="Optional title for the source")
-    args = parser.parse_args(argv)
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        args = ["--srt", "samples/media/your_clip.srt", "--title", "Sample"]
+    return ingest_main(args)
 
-    count = ingest_subtitle(Path(args.subtitle), source_title=args.title)
-    if count == 0:
-        return 1
-    return 0
 
 
 if __name__ == "__main__":
